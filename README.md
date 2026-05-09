@@ -1,43 +1,50 @@
 # Document Intelligence Processor
 
-A four-stage pipeline that turns a document image into structured, 
-queryable data by chaining OCR, reading-order detection, layout 
-detection, and an AI agent with vision tools.
+An intelligent document processing pipeline that converts PDFs and images into structured Markdown. It uses a **Hybrid Extraction** approach: leveraging the precision of PDF text layers where available, and the "vision" of Large Language Models (GPT-4o) for complex elements like tables and charts.
 
 ---
 
-## Architecture
+## Architecture (Hybrid Flow)
 
+```mermaid
+graph TD
+    A[Input PDF / Image] --> B{Source Type}
+    
+    subgraph "Preprocessing"
+    B -->|PDF| C[Render Pages to 150 DPI Images]
+    B -->|Image| D[Load Image]
+    end
+    
+    subgraph "Layout Detection"
+    C --> E[PPStructure Layout Analysis]
+    D --> E
+    E --> F[Reading Order Sorting]
+    end
+    
+    subgraph "Hybrid Extraction"
+    F --> G{Region Type?}
+    G -->|Text / Title| H{PDF Layer?}
+    H -->|Yes| I[Extract via PyMuPDF Clip]
+    H -->|No| J[Extract via PaddleOCR]
+    
+    G -->|Table| K[OpenAI Vision GPT-4o]
+    G -->|Figure / Chart| K
+    end
+    
+    I --> L[Markdown Output]
+    J --> L
+    K --> L[JSON Embedded in Markdown]
 ```
-Input Image
-    │
-    ├──► Stage 1 – OCR (PaddleOCR)
-    │         text strings, bounding boxes, confidence scores
-    │              │
-    │              ▼
-    │    Stage 2 – Reading Order (LayoutReader / LayoutLMv3)
-    │         orders OCR regions left-to-right, top-to-bottom
-    │
-    └──► Stage 3 – Layout Detection (PaddleOCR LayoutDetection)
-              tables, figures, text blocks, titles
-                   │
-                   ▼
-         Stage 4 – Document Agent (Claude + tool use)
-         ┌─────────────────────────────────────────────┐
-         │  System Prompt                               │
-         │  • ordered OCR text                          │
-         │  • region IDs & types                        │
-         │  • tool descriptions                         │
-         │                                              │
-         │  AnalyzeChart tool                           │
-         │  → crops region → Claude Vision              │
-         │  ← chart_type, axes, data_points, trends     │
-         │                                              │
-         │  AnalyzeTable tool                           │
-         │  → crops region → Claude Vision              │
-         │  ← headers, rows, values, notes              │
-         └─────────────────────────────────────────────┘
-```
+
+---
+
+## Key Features
+
+-   **Hybrid Text Extraction**: Uses PyMuPDF to "snip" text directly from the PDF layer for perfect accuracy, falling back to PaddleOCR for scanned regions.
+-   **Visual Table Parsing**: Converts complex table images into structured JSON using OpenAI's GPT-4o Vision.
+-   **Figure Analysis**: Automatically describes charts and diagrams, extracting data points and trends.
+-   **Reading Order Awareness**: Intelligently sorts detected regions into a logical top-to-bottom, left-to-right reading flow.
+-   **Cross-Format Support**: Handles standard PDFs, scanned documents, and 15+ image formats (.png, .jpg, .webp, .heic, etc.).
 
 ---
 
@@ -50,25 +57,20 @@ pip install -r requirements.txt
 ```
 
 ### 2. Set your OpenAI API key
+Ensure you have an `.env` file or export your key:
 
 ```bash
 export OPENAI_API_KEY="sk-..."
 ```
 
-### 3. Run
+### 3. Run via CLI
 
 ```bash
-# Default: full summary + analyse all tables/charts
-python run.py report.png
+# Process a PDF and save as Markdown
+python run.py document.pdf --output result.md
 
-# Custom query
-python run.py report.png --query "What are the Q3 revenue figures?"
-
-# Save annotated layout image and Markdown result
-python run.py report.png \
-    --annotated annotated.png \
-    --output result.md \
-    --verbose
+# Process and save an annotated image showing detected regions
+python run.py document.pdf --annotated layout.png --output result.md
 ```
 
 ---
@@ -78,73 +80,49 @@ python run.py report.png \
 ```python
 from document_processor import DocumentProcessor
 
-processor = DocumentProcessor(ocr_lang="en")
+# Initialize with desired OCR language and VLM model
+processor = DocumentProcessor(ocr_lang="en", vlm_model="gpt-4o")
 
+# Process document
 result = processor.process(
-    image_path="report.png",
-    query="Summarise the key metrics from all tables.",
-    save_annotated="annotated.png",   # optional
+    input_path="report.pdf",
+    save_annotated="debug_layout.png"
 )
 
-# Markdown report
-print(result.as_markdown())
+# Export to Markdown
+markdown_content = result.as_markdown()
+print(markdown_content)
+```
 
-# Programmatic access
-for entry in result.ordered_text:
-    print(entry.position, entry.text)
+---
 
-for region in result.layout_regions:
-    print(region.region_id, region.region_type, region.bbox)
+## Data Models
 
-for rid, analysis in result.region_analyses.items():
-    print(rid, analysis)
+### `PageElement`
+Every detected region (text, table, figure) is stored as a `PageElement`:
+- `element_type`: "text", "title", "table", "figure"
+- `content`: `str` for text; `dict` (JSON) for tables/figures.
+- `bbox`: `[x1, y1, x2, y2]` coordinates.
+- `confidence`: Detection confidence score.
+
+### `Table` Extraction JSON
+```json
+{
+  "headers": ["Product", "Units", "Revenue"],
+  "rows": [["Widget A", "1200", "$48K"], ...],
+  "notes": "Figures are unaudited estimates.",
+  "region_type": "table"
+}
 ```
 
 ---
 
 ## Module Reference
 
-| Class / File            | Responsibility                                                |
-|-------------------------|---------------------------------------------------------------|
-| `OCRExtractor`          | Wraps PaddleOCR; returns `List[OCRRegion]`                    |
-| `ReadingOrderDetector`  | Wraps LayoutReader; returns `List[OrderedTextEntry]`          |
-| `LayoutDetector`        | Wraps PaddleOCR LayoutDetection; returns `List[LayoutRegion]` |
-| `DocumentAgent`         | Agentic loop; calls `AnalyzeChart` / `AnalyzeTable` via VLM  |
-| `DocumentProcessor`     | Orchestrator: chains all four stages                          |
-| `run.py`                | CLI entry point                                               |
-
----
-
-## Output Shape
-
-```python
-@dataclass
-class DocumentResult:
-    ordered_text:     List[OrderedTextEntry]   # reading-order OCR
-    layout_regions:   List[LayoutRegion]       # detected regions
-    region_analyses:  Dict[int, dict]          # VLM tool results
-```
-
-### `AnalyzeChart` returns
-```json
-{
-  "type": "chart",
-  "region_id": 2,
-  "chart_type": "bar",
-  "x_axis": "Quarter",
-  "y_axis": "Revenue ($M)",
-  "data_points": [{"label": "Q1", "value": 12.4}, ...],
-  "trends": ["Revenue grew 18% YoY", "Q3 peak"]
-}
-```
-
-### `AnalyzeTable` returns
-```json
-{
-  "type": "table",
-  "region_id": 5,
-  "headers": ["Product", "Units", "Revenue"],
-  "rows": [["Widget A", "1200", "$48K"], ...],
-  "notes": "Figures are unaudited estimates."
-}
-```
+| Class / File | Responsibility |
+| :--- | :--- |
+| `LayoutDetector` | Uses PaddleOCR `PPStructure` to find layout regions. |
+| `OCRExtractor` | Fallback OCR engine for scanned text regions. |
+| `VLMAnalyzer` | Interfaces with OpenAI Vision for tables and figures. |
+| `DocumentProcessor` | Orchestrates the hybrid flow and coordinate mapping. |
+| `run.py` | CLI entry point for processing and saving results. |
