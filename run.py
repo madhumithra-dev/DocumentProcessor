@@ -45,6 +45,33 @@ def main():
         help="OCR language code passed to PaddleOCR (default: en)",
     )
     parser.add_argument(
+        "--provider",
+        choices=["openai", "ollama"],
+        default="openai",
+        help="VLM provider to use (default: openai)",
+    )
+    parser.add_argument(
+        "--vlm-model",
+        default="gpt-4o",
+        help="Model name for the VLM provider (default: gpt-4o for openai, llava for ollama)",
+    )
+    parser.add_argument(
+        "--ollama-host",
+        default="http://localhost:11434",
+        help="Host URL for Ollama (default: http://localhost:11434)",
+    )
+    parser.add_argument(
+        "--ollama-timeout",
+        type=int,
+        default=300,
+        help="Timeout in seconds for Ollama requests (default: 300)",
+    )
+    parser.add_argument(
+        "--skip-vcot",
+        action="store_true",
+        help="Skip the 'Observation' step in the agentic flow (saves time, but may reduce accuracy)",
+    )
+    parser.add_argument(
         "--annotated",
         type=Path,
         default=None,
@@ -54,7 +81,13 @@ def main():
         "--output",
         type=Path,
         default=None,
-        help="Save the Markdown result to this file (default: print to stdout)",
+        help="Save the Markdown result to this file",
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Save the structured JSON result to this file",
     )
     parser.add_argument(
         "--verbose",
@@ -76,18 +109,40 @@ def main():
             f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
         )
 
-    processor = DocumentProcessor(ocr_lang=args.lang)
+    # Initialise VLM provider
+    from document_processor import OpenAIProvider, OllamaProvider
+    if args.provider == "openai":
+        vlm_provider = OpenAIProvider(model=args.vlm_model)
+    elif args.provider == "ollama":
+        # Default to llava if model not specified for ollama
+        m = args.vlm_model if args.vlm_model != "gpt-4o" else "llava"
+        vlm_provider = OllamaProvider(model=m, host=args.ollama_host, timeout=args.ollama_timeout)
+    else:
+        vlm_provider = OpenAIProvider(model=args.vlm_model)
+
+    processor = DocumentProcessor(
+        ocr_lang=args.lang, 
+        vlm_provider=vlm_provider,
+        use_vcot=not args.skip_vcot
+    )
     result = processor.process(
         input_path=args.document,
         save_annotated=args.annotated,
     )
 
+    # Save Markdown
     md = result.as_markdown()
-
     if args.output:
         args.output.write_text(md, encoding="utf-8")
-        log.info("Result written to %s", args.output)
-    else:
+        log.info("Markdown result written to %s", args.output)
+    
+    # Save JSON
+    if args.output_json:
+        args.output_json.write_text(result.as_json(), encoding="utf-8")
+        log.info("JSON result written to %s", args.output_json)
+
+    # If no output files specified, print markdown to stdout
+    if not args.output and not args.output_json:
         print("\n" + "=" * 72)
         print(md)
         print("=" * 72)

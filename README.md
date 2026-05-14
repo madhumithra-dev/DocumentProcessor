@@ -1,50 +1,45 @@
 # Document Intelligence Processor
 
-An intelligent document processing pipeline that converts PDFs and images into structured Markdown. It uses a **Hybrid Extraction** approach: leveraging the precision of PDF text layers where available, and the "vision" of Large Language Models (GPT-4o) for complex elements like tables and charts.
+An intelligent document processing pipeline that converts PDFs and images into structured Markdown and JSON. It leverages a **LangChain-powered Agentic Flow** to achieve human-level accuracy in extracting complex tables and figures.
 
 ---
 
-## Architecture (Hybrid Flow)
+## Agentic Architecture
+
+The processor uses a multi-layered extraction strategy managed by a **LangChain Agent**:
+
+1.  **Structured Output (Primary)**: Uses OpenAI's native tool-calling with **Pydantic schemas** to enforce strict data structures (Headers, Rows, Data Points).
+2.  **Visual Chain-of-Thought (Fallback)**: If structure extraction is ambiguous, the agent performs a "Think-then-Extract" loop:
+    -   **Observe**: The model describes the visual layout in natural language to focus its attention.
+    -   **Extract**: The model uses its own description as context to generate valid JSON.
+    -   **Refine**: Automatic self-correction if JSON validation fails.
 
 ```mermaid
 graph TD
-    A[Input PDF / Image] --> B{Source Type}
+    A[Region Crop] --> B{LangChain Agent}
+    B -->|Native| C[Structured Output Tool]
+    C -->|Success| G[Final Markdown/JSON]
     
-    subgraph "Preprocessing"
-    B -->|PDF| C[Render Pages to 150 DPI Images]
-    B -->|Image| D[Load Image]
+    B -->|Fallback| D[Visual CoT Loop]
+    subgraph "Reasoning Loop"
+    D --> E[1. Observe Structure]
+    E --> F[2. Contextual Extract]
+    F --> H{Valid?}
+    H -->|No| I[3. Refine/Fix]
+    I --> G
+    H -->|Yes| G
     end
-    
-    subgraph "Layout Detection"
-    C --> E[PPStructure Layout Analysis]
-    D --> E
-    E --> F[Reading Order Sorting]
-    end
-    
-    subgraph "Hybrid Extraction"
-    F --> G{Region Type?}
-    G -->|Text / Title| H{PDF Layer?}
-    H -->|Yes| I[Extract via PyMuPDF Clip]
-    H -->|No| J[Extract via PaddleOCR]
-    
-    G -->|Table| K[OpenAI Vision GPT-4o]
-    G -->|Figure / Chart| K
-    end
-    
-    I --> L[Markdown Output]
-    J --> L
-    K --> L[JSON Embedded in Markdown]
 ```
 
 ---
 
 ## Key Features
 
--   **Hybrid Text Extraction**: Uses PyMuPDF to "snip" text directly from the PDF layer for perfect accuracy, falling back to PaddleOCR for scanned regions.
--   **Visual Table Parsing**: Converts complex table images into structured JSON using OpenAI's GPT-4o Vision.
--   **Figure Analysis**: Automatically describes charts and diagrams, extracting data points and trends.
--   **Reading Order Awareness**: Intelligently sorts detected regions into a logical top-to-bottom, left-to-right reading flow.
--   **Cross-Format Support**: Handles standard PDFs, scanned documents, and 15+ image formats (.png, .jpg, .webp, .heic, etc.).
+-   **LangChain Agentic Flow**: High-reliability extraction using advanced reasoning and self-correction.
+-   **Native Pydantic Validation**: Guarantees that extracted tables and charts match your required JSON schema.
+-   **Hybrid Text Extraction**: Precision PyMuPDF clipping for text layers, falling back to PaddleOCR for scanned content.
+-   **Multi-Provider Support**: Built-in support for **OpenAI** (via LangChain) and **Ollama** (Local models).
+-   **Dual Output**: Generates both machine-readable JSON and human-readable Markdown.
 
 ---
 
@@ -56,73 +51,44 @@ graph TD
 pip install -r requirements.txt
 ```
 
-### 2. Set your OpenAI API key
-Ensure you have an `.env` file or export your key:
+### 2. Configure OpenAI
 
-```bash
-export OPENAI_API_KEY="sk-..."
-```
+Set your `OPENAI_API_KEY` in an `.env` file or environment variable.
 
 ### 3. Run via CLI
 
 ```bash
-# Process a PDF and save as Markdown
-python run.py document.pdf --output result.md
+# Process a PDF with the LangChain Agent
+python run.py document.pdf --output result.md --output-json result.json
 
-# Process and save an annotated image showing detected regions
-python run.py document.pdf --annotated layout.png --output result.md
+# Process an image with a local Ollama model
+python run.py image.png --provider ollama --vlm-model llava
 ```
 
 ---
 
-## Python API
+## Data Models (Pydantic)
 
-```python
-from document_processor import DocumentProcessor
+We enforce strict schemas for visual elements to ensure downstream data reliability:
 
-# Initialize with desired OCR language and VLM model
-processor = DocumentProcessor(ocr_lang="en", vlm_model="gpt-4o")
+### `TableSchema`
+- `headers`: List of column names.
+- `rows`: 2D list of cells (supports strings, numbers, and nulls).
+- `notes`: Captions or footnotes found near the table.
 
-# Process document
-result = processor.process(
-    input_path="report.pdf",
-    save_annotated="debug_layout.png"
-)
-
-# Export to Markdown
-markdown_content = result.as_markdown()
-print(markdown_content)
-```
-
----
-
-## Data Models
-
-### `PageElement`
-Every detected region (text, table, figure) is stored as a `PageElement`:
-- `element_type`: "text", "title", "table", "figure"
-- `content`: `str` for text; `dict` (JSON) for tables/figures.
-- `bbox`: `[x1, y1, x2, y2]` coordinates.
-- `confidence`: Detection confidence score.
-
-### `Table` Extraction JSON
-```json
-{
-  "headers": ["Product", "Units", "Revenue"],
-  "rows": [["Widget A", "1200", "$48K"], ...],
-  "notes": "Figures are unaudited estimates.",
-  "region_type": "table"
-}
-```
+### `FigureSchema`
+- `figure_type`: Bar chart, Line graph, Flowchart, etc.
+- `description`: Detailed textual analysis of the visual content.
+- `data_points`: Extracted label-value pairs.
+- `trends`: Key insights or observed trends.
 
 ---
 
 ## Module Reference
 
-| Class / File | Responsibility |
+| Component | Responsibility |
 | :--- | :--- |
-| `LayoutDetector` | Uses PaddleOCR `PPStructure` to find layout regions. |
-| `OCRExtractor` | Fallback OCR engine for scanned text regions. |
-| `VLMAnalyzer` | Interfaces with OpenAI Vision for tables and figures. |
-| `DocumentProcessor` | Orchestrates the hybrid flow and coordinate mapping. |
-| `run.py` | CLI entry point for processing and saving results. |
+| `DocumentAgent` | Orchestrates the LangChain reasoning and extraction logic. |
+| `OpenAIProvider` | LangChain-based interface for OpenAI Models. |
+| `LayoutDetector` | PaddleOCR PPStructure for region identification. |
+| `DocumentProcessor` | Main orchestrator managing the hybrid PDF/OCR/VLM pipeline. |

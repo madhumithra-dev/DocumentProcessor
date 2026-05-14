@@ -11,21 +11,27 @@ Pipeline:
   Image → treated as single image-based page (same as above)
 """
 
-from __future__ import annotations
-
 import base64
 import json
 import logging
 import torch  # Import first to lock DLL versions on Windows (prevents WinError 127)
-from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field, asdict
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, Type, TypeVar
 
 import cv2
 import numpy as np
 import openai
+import requests
 from PIL import Image
+from pydantic import BaseModel, Field, ValidationError
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -99,6 +105,30 @@ class DocumentResult:
             lines.append(page.as_markdown())
             lines.append("\n---\n")
         return "\n".join(lines)
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+    def as_json(self) -> str:
+        return json.dumps(self.as_dict(), indent=2, ensure_ascii=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Structured Data Schemas (Pydantic)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TableSchema(BaseModel):
+    headers: list[str] = Field(description="List of column headers")
+    rows: list[list[str | int | float | None]] = Field(description="List of rows, each containing a list of cell values (strings or numbers)")
+    notes: str = Field(default="", description="Any additional notes or captions found near the table")
+
+class FigureSchema(BaseModel):
+    figure_type: str = Field(description="Type of figure (e.g., bar chart, flowchart, line graph)")
+    description: str = Field(description="Comprehensive textual description of the visual content")
+    data_points: list[dict[str, str | int | float | None]] = Field(default_factory=list, description="Extracted data points as label-value pairs")
+    trends: list[str] = Field(default_factory=list, description="Key trends or insights observed in the figure")
+
+T = TypeVar("T", bound=BaseModel)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -185,59 +215,132 @@ class OCRExtractor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage C – VLM analysis for table / figure regions (OpenAI Vision)
+# Stage C – Agentic VLM analysis (VCoT + Self-Correction)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class VLMAnalyzer:
-    def __init__(self, model: str = "gpt-4o"):
-        self._client = openai.OpenAI()
-        self._model = model
+class VLMProvider(ABC):
+    @abstractmethod
+    def call(self, pil_image: Image.Image, prompt: str) -> str:
+        pass
 
-    def _call(self, pil_image: Image.Image, prompt: str) -> dict:
+class OpenAIProvider(VLMProvider):
+    def __init__(self, model: str = "gpt-4o"):
+        self._model = model
+        self._llm = ChatOpenAI(model=model, max_tokens=2048)
+
+    def call(self, pil_image: Image.Image, prompt: str) -> str:
         b64 = pil_to_base64(pil_image)
-        resp = self._client.chat.completions.create(
-            model=self._model,
-            max_tokens=2048,
-            messages=[{
-                "role": "user",
-                "content": [
+        message = HumanMessage(
+            content=[
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                },
+            ]
+        )
+        resp = self._llm.invoke([message])
+        return str(resp.content).strip()
+
+class OllamaProvider(VLMProvider):
+    def __init__(self, model: str = "llava", host: str = "http://localhost:11434", timeout: int = 300):
+        self._model = model
+        self._host = host
+        self._timeout = timeout
+
+    def call(self, pil_image: Image.Image, prompt: str) -> str:
+        b64 = pil_to_base64(pil_image)
+        url = f"{self._host}/api/generate"
+        payload = {
+            "model": self._model,
+            "prompt": prompt,
+            "images": [b64],
+            "stream": False
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=self._timeout)
+            resp.raise_for_status()
+            return resp.json().get("response", "").strip()
+        except Exception as e:
+            log.error("Ollama call failed (timeout=%ds): %s", self._timeout, e)
+            return f"Error: {str(e)}"
+
+class DocumentAgent:
+    """
+    Agentic wrapper for VLM extraction.
+    Uses Visual Chain-of-Thought (Observe -> Extract) and Self-Correction.
+    """
+    def __init__(self, provider: VLMProvider, use_vcot: bool = True):
+        self._provider = provider
+        self._use_vcot = use_vcot
+
+    def _extract_json(self, text: str) -> str:
+        if "```json" in text:
+            return text.split("```json")[1].split("```")[0].strip()
+        if "```" in text:
+            return text.split("```")[1].split("```")[0].strip()
+        return text.strip()
+
+    def analyze_region(self, pil_image: Image.Image, schema: Type[T], region_type: str) -> dict:
+        log.info("    [LangChain Agent] Analyzing %s...", region_type)
+        
+        # Use LangChain's structured output capability
+        if hasattr(self._provider, "_llm"):
+            llm = self._provider._llm.with_structured_output(schema)
+            
+            b64 = pil_to_base64(pil_image)
+            prompt = f"Extract the data from this {region_type} crop according to the schema."
+            
+            message = HumanMessage(
+                content=[
+                    {"type": "text", "text": prompt},
                     {
                         "type": "image_url",
                         "image_url": {"url": f"data:image/png;base64,{b64}"},
                     },
-                    {"type": "text", "text": prompt},
-                ],
-            }],
+                ]
+            )
+            
+            try:
+                # This automatically handles JSON parsing and validation against the Pydantic schema
+                result_obj = llm.invoke([message])
+                result = result_obj.model_dump()
+                result["region_type"] = region_type
+                return result
+            except Exception as e:
+                log.warning("    [LangChain Agent] Structured output failed, falling back to manual: %s", e)
+
+        # Fallback to manual flow if not using LangChain-compatible provider or if it failed
+        observation = ""
+        if self._use_vcot:
+            obs_prompt = (
+                f"Observe this {region_type} crop carefully. Describe its layout, structure, "
+                "and all visible data points in detail. Do not output JSON yet."
+            )
+            observation = self._provider.call(pil_image, obs_prompt)
+
+        extract_prompt = (
+            f"Extract the data from this {region_type} into a JSON object matching the schema.\n"
+            f"Observation: {observation}\n"
+            f"Schema: {json.dumps(schema.model_json_schema())}"
         )
-        raw = resp.choices[0].message.content.strip()
-        # Strip markdown fences if present
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        
+        raw_response = self._provider.call(pil_image, extract_prompt)
+        json_str = self._extract_json(raw_response)
+        
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return {"raw": raw}
+            validated = schema.model_validate_json(json_str)
+            result = validated.model_dump()
+            result["region_type"] = region_type
+            return result
+        except Exception as e:
+            return {"raw": raw_response, "region_type": region_type, "error": str(e)}
 
     def analyze_table(self, pil_image: Image.Image) -> dict:
-        log.info("    → VLM: AnalyzeTable")
-        result = self._call(
-            pil_image,
-            "Extract this table. Respond ONLY with a JSON object (no markdown fences) "
-            "with keys: headers (list), rows (list of lists), notes (string).",
-        )
-        result["region_type"] = "table"
-        return result
+        return self.analyze_region(pil_image, TableSchema, "table")
 
     def analyze_figure(self, pil_image: Image.Image, region_type: str = "figure") -> dict:
-        log.info("    → VLM: AnalyzeFigure (%s)", region_type)
-        result = self._call(
-            pil_image,
-            "Analyse this figure/chart. Respond ONLY with a JSON object (no markdown fences) "
-            "with keys: figure_type (str), description (str), "
-            "data_points (list of {label, value}), trends (list of strings).",
-        )
-        result["region_type"] = region_type
-        return result
+        return self.analyze_region(pil_image, FigureSchema, region_type)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -303,18 +406,16 @@ class DocumentProcessor:
     -----------------------------------------------------
     1. LayoutDetector (PPStructure) finds all regions.
     2. Regions are sorted into reading order (top→bottom, left→right).
-    3. For each region in order:
-         text / title  → If PDF layer exists: use PyMuPDF clip
-                         Else: use PaddleOCR on the cropped region
-         table         → OpenAI Vision → structured JSON
-         figure        → OpenAI Vision → structured JSON
-    4. Results are collected as PageElements in that order.
+    Unified processor for both PDFs and images using an Agentic VLM flow.
     """
 
-    def __init__(self, ocr_lang: str = "en", vlm_model: str = "gpt-4o"):
+    def __init__(self, ocr_lang: str = "en", vlm_provider: VLMProvider | None = None, use_vcot: bool = True):
         self._layout = LayoutDetector()
         self._ocr = OCRExtractor(lang=ocr_lang)
-        self._vlm = VLMAnalyzer(model=vlm_model)
+        
+        # Default to OpenAI if no provider given
+        provider = vlm_provider or OpenAIProvider()
+        self._agent = DocumentAgent(provider, use_vcot=use_vcot)
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -417,9 +518,9 @@ class DocumentProcessor:
             )
 
             if rtype == "table" and rtype in _VLM_TYPES:
-                content: Any = self._vlm.analyze_table(crop)
+                content: Any = self._agent.analyze_table(crop)
             elif rtype in _VLM_TYPES:  # figure, chart
-                content = self._vlm.analyze_figure(crop, region_type=rtype)
+                content = self._agent.analyze_figure(crop, region_type=rtype)
             else:  # text, title, caption, reference, equation, etc.
                 # Try PDF text extraction first if fitz_page is available
                 extracted = ""
